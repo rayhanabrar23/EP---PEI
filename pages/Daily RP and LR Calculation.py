@@ -478,6 +478,15 @@ if shared_ready:
             op_data_raw = parse_op_file(op_content)
             st.session_state['shared_op_data_raw'] = op_data_raw
 
+            # Adjustment Participant Stock Position (yang lama — WAJIB ADA)
+            if file_pos is not None:
+                stock_position = load_participant_stock_position(file_pos)
+                st.session_state['shared_stock_position'] = stock_position
+                st.session_state['shared_op_data'] = apply_position_adjustment_to_op(op_data_raw, stock_position)
+            else:
+                st.session_state['shared_stock_position'] = {}
+                st.session_state['shared_op_data'] = op_data_raw
+
             # ── BARU: adjustment Loan Existing dari LR belum settle ──
             if file_lr_settle is not None:
                 lr_belum_settle = load_lr_belum_settle(file_lr_settle)
