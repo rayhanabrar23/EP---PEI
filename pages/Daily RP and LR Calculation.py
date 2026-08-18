@@ -14,7 +14,7 @@ for key in [
     'shared_closing_prices', 'shared_risk_params', 'shared_risk_avail_qty',
     'shared_netting', 'shared_net_buy', 'shared_net_sell', 'shared_cid_to_sid',
     'shared_op_data', 'shared_op_data_raw', 'shared_stock_position',
-    'shared_cl_data', 'shared_cl_value_date',
+    'shared_cl_data', 'shared_cl_value_date',  'shared_lr_belum_settle', 
     # TRX PEI
     'pei_results', 'pei_results_original',
     # Validasi MNC
@@ -267,6 +267,47 @@ def load_participant_stock_position(uploaded_file) -> dict:
         }
     return result
 
+def load_lr_belum_settle(uploaded_file) -> dict:
+    """
+    Parse file Data Transaksi LR (.txt, pipe-delimited) — LR yang sudah diproses
+    tapi belum settle (Tanggal Efektif > tanggal OP), sehingga belum tercatat
+    sebagai Loan Existing di file OP.
+
+    Baris '0': Broker|SID|No LR|Tgl Transaksi|Tgl Efektif|Tgl Jatuh Tempo|Nilai LR
+    Ambil kolom TERAKHIR (Nilai LR), sum per SID kalau ada beberapa No LR
+    untuk SID yang sama.
+
+    Return: {sid: total_nilai_lr_belum_settle}
+    """
+    result = {}
+    content = uploaded_file.read().decode("utf-8", errors="replace")
+    uploaded_file.seek(0)
+    for line in content.strip().splitlines():
+        line = line.strip()
+        if not line: continue
+        parts = line.split("|")
+        if parts[0] != "0": continue
+        if len(parts) < 8: continue
+        sid = parts[2].strip()
+        try: nilai_lr = float(parts[-1])
+        except: nilai_lr = 0.0
+        result[sid] = result.get(sid, 0.0) + nilai_lr
+    return result
+
+
+def apply_lr_adjustment_to_op(op_data: dict, lr_belum_settle: dict) -> dict:
+    """
+    Tambahkan Loan Existing dengan nilai LR yang sudah diproses tapi belum
+    settle. SID yang ada di file LR ini tapi TIDAK ada di OP tetap DILEWATI
+    (perlakuan sama seperti Participant Stock Position).
+    """
+    result = copy.deepcopy(op_data)
+    for sid, nilai_lr in lr_belum_settle.items():
+        if sid not in result:
+            continue
+        result[sid]['loan_existing'] = result[sid].get('loan_existing', 0.0) + nilai_lr
+    return result
+
 
 def apply_position_adjustment_to_op(op_data: dict, stock_position: dict) -> dict:
     """
@@ -411,12 +452,18 @@ file_pos = st.file_uploader(
     type=['txt'], key='shared_pos'
 )
 
+file_lr_settle = st.file_uploader(
+    "7. Data Transaksi LR (.txt) — opsional, koreksi Loan Existing yang belum settle",
+    type=['txt'], key='shared_lr_settle'
+)
+
 shared_ready = all([file_cp, file_rp, file_op, file_netinv, file_cl])
 
 if shared_ready:
     # [DIUBAH] file_sig sekarang ikut memperhitungkan file_pos (opsional)
     pos_sig  = file_pos.name if file_pos is not None else "none"
-    file_sig = f"{file_cp.name}_{file_rp.name}_{file_op.name}_{file_netinv.name}_{file_cl.name}_{pos_sig}"
+    lr_sig   = file_lr_settle.name if file_lr_settle is not None else "none"
+    file_sig = f"{file_cp.name}_{file_rp.name}_{file_op.name}_{file_netinv.name}_{file_cl.name}_{pos_sig}_{lr_sig}"
     if st.session_state.get('_shared_file_sig') != file_sig:
         with st.spinner("⚙️ Memuat file bersama..."):
             st.session_state['shared_closing_prices'] = load_closing_price(file_cp)
@@ -431,14 +478,15 @@ if shared_ready:
             op_data_raw = parse_op_file(op_content)
             st.session_state['shared_op_data_raw'] = op_data_raw
 
-            if file_pos is not None:
-                stock_position = load_participant_stock_position(file_pos)
-                st.session_state['shared_stock_position'] = stock_position
-                st.session_state['shared_op_data'] = apply_position_adjustment_to_op(op_data_raw, stock_position)
+            # ── BARU: adjustment Loan Existing dari LR belum settle ──
+            if file_lr_settle is not None:
+                lr_belum_settle = load_lr_belum_settle(file_lr_settle)
+                st.session_state['shared_lr_belum_settle'] = lr_belum_settle
+                st.session_state['shared_op_data'] = apply_lr_adjustment_to_op(
+                    st.session_state['shared_op_data'], lr_belum_settle)
             else:
-                st.session_state['shared_stock_position'] = {}
-                st.session_state['shared_op_data'] = op_data_raw
-            # [SELESAI DIUBAH]
+                st.session_state['shared_lr_belum_settle'] = {}
+            # ── SELESAI BARU ──
 
             netting, cid_to_sid, sid_to_name = parse_netting_invoice(file_netinv)
             net_buy, net_sell   = split_netting(netting)
@@ -461,6 +509,11 @@ if shared_ready:
         if file_pos is not None:
             st.info(f"🔄 Posisi OP disesuaikan dengan Participant Stock Position — "
                     f"**{n_adj_sid}** SID mengalami koreksi qty saham (commitment belum settle T+2).")
+        # [BARU] Info jumlah SID yang kena koreksi Loan Existing dari LR belum settle
+        n_adj_lr = len(st.session_state.get('shared_lr_belum_settle') or {})
+        if file_lr_settle is not None:
+            st.info(f"💰 Loan Existing disesuaikan dengan LR belum settle — "
+                    f"**{n_adj_lr}** SID mengalami penambahan Loan Existing.")
     cl_vdate = st.session_state.get('shared_cl_value_date')
     if cl_vdate:
         today_check = datetime.today().strftime("%Y/%m/%d")
