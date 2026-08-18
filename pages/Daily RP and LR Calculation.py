@@ -13,7 +13,8 @@ st.title("📊 PEI Tools — TRX PEI & Validasi MNC")
 for key in [
     'shared_closing_prices', 'shared_risk_params', 'shared_risk_avail_qty',
     'shared_netting', 'shared_net_buy', 'shared_net_sell', 'shared_cid_to_sid',
-    'shared_op_data', 'shared_cl_data', 'shared_cl_value_date',
+    'shared_op_data', 'shared_op_data_raw', 'shared_stock_position',
+    'shared_cl_data', 'shared_cl_value_date',
     # TRX PEI
     'pei_results', 'pei_results_original',
     # Validasi MNC
@@ -25,7 +26,7 @@ for key in [
 
 if 'clamped_warnings' not in st.session_state:
     st.session_state['clamped_warnings'] = []
-    
+
 if 'sid_results_original' not in st.session_state:
     st.session_state['sid_results_original'] = {}
 
@@ -220,6 +221,79 @@ def parse_credit_limit_file(content: str):
         result[sid] = {"available_limit": avail_limit, "name": parts[3].strip(), "value_date": parts[0].strip()}
     return result, value_date
 
+
+# ═══════════════════════════════════════════════════════════════
+# [BARU] PARTICIPANT STOCK POSITION — koreksi posisi OP yang belum settle T+2
+# ═══════════════════════════════════════════════════════════════
+def load_participant_stock_position(uploaded_file) -> dict:
+    """
+    Parse file Participant Stock Position (.txt, pipe-delimited).
+    Kolom: As Of Date|Broker Code|SRE|SID|Name|Stock Code|Quantity On Hand|
+           Quantity On Hold|Quantity Commitment Receive|Quantity Commitment Deliver|
+           Quantity Request Deliver|Quantity Request Receive|Quantity Balance|
+           Quantity Corpact|Quantity After Corpact
+
+    Commitment Receive = ada transaksi Buy yang belum settle -> MENAMBAH posisi (basis LR)
+    Commitment Deliver = ada transaksi Sell yang belum settle -> MENGURANGI posisi (basis RP)
+
+    Return:
+        {sid: {stock: {'receive': x, 'deliver': y, 'delta': x - y}}}
+        (saham dengan delta == 0 tidak dimasukkan — tidak ada penyesuaian)
+    """
+    result = {}
+    content = uploaded_file.read().decode("utf-8", errors="replace")
+    uploaded_file.seek(0)
+    lines = content.strip().splitlines()
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        if i == 0 and line.lower().startswith("as of date"):
+            continue
+        parts = line.split("|")
+        if len(parts) < 10:
+            continue
+        sid   = parts[3].strip()
+        stock = parts[5].strip().upper()
+        try: receive = float(parts[8])
+        except: receive = 0.0
+        try: deliver = float(parts[9])
+        except: deliver = 0.0
+        delta = receive - deliver
+        if delta == 0:
+            continue
+        result.setdefault(sid, {})[stock] = {
+            'receive': receive, 'deliver': deliver, 'delta': delta,
+        }
+    return result
+
+
+def apply_position_adjustment_to_op(op_data: dict, stock_position: dict) -> dict:
+    """
+    Sesuaikan posisi saham di OP berdasarkan Participant Stock Position
+    (transaksi yang belum settle T+2).
+        qty_baru = qty_OP_lama + commit_receive - commit_deliver
+    Kolateral otomatis berubah karena semua fungsi hilir (calc_collateral,
+    matching RP, dst) memakai stocks_op hasil adjustment ini.
+
+    SID yang muncul di Position tapi TIDAK ada di OP (tidak ada data loan/accrued)
+    akan DILEWATI — Position hanya menyesuaikan SID yang sudah terdaftar di OP.
+    """
+    result = copy.deepcopy(op_data)
+    for sid, stocks_adj in stock_position.items():
+        if sid not in result:
+            continue
+        stocks = result[sid]['stocks']
+        for stock, adj in stocks_adj.items():
+            new_qty = stocks.get(stock, 0) + adj['delta']
+            if new_qty <= 0:
+                stocks.pop(stock, None)
+            else:
+                stocks[stock] = new_qty
+    return result
+# ═══════════════════════════════════════════════════════════════
+
+
 def parse_netting_invoice(uploaded_file):
     """
     Parse file Netting Invoice (list of invoice, format .xls/.xlsx/.csv).
@@ -331,10 +405,18 @@ with col4:
 with col5:
     file_cl     = st.file_uploader("5. Credit Limit (.txt)", type=['txt'], key='shared_cl')
 
+# [BARU] File ke-6 — opsional, tidak wajib untuk shared_ready
+file_pos = st.file_uploader(
+    "6. Participant Stock Position (.txt) — opsional, koreksi OP T+2 belum settle",
+    type=['txt'], key='shared_pos'
+)
+
 shared_ready = all([file_cp, file_rp, file_op, file_netinv, file_cl])
 
 if shared_ready:
-    file_sig = f"{file_cp.name}_{file_rp.name}_{file_op.name}_{file_netinv.name}_{file_cl.name}"
+    # [DIUBAH] file_sig sekarang ikut memperhitungkan file_pos (opsional)
+    pos_sig  = file_pos.name if file_pos is not None else "none"
+    file_sig = f"{file_cp.name}_{file_rp.name}_{file_op.name}_{file_netinv.name}_{file_cl.name}_{pos_sig}"
     if st.session_state.get('_shared_file_sig') != file_sig:
         with st.spinner("⚙️ Memuat file bersama..."):
             st.session_state['shared_closing_prices'] = load_closing_price(file_cp)
@@ -343,8 +425,22 @@ if shared_ready:
             st.session_state['shared_risk_avail_qty'] = risk_avq
             op_content = file_op.read().decode("utf-8", errors="replace")
             file_op.seek(0)
-            st.session_state['shared_op_data']        = parse_op_file(op_content)
-            netting, cid_to_sid = parse_netting_invoice(file_netinv)
+
+            # [DIUBAH] Parsing OP: sekarang lewat 2 tahap — raw dulu, baru disesuaikan
+            # dengan Participant Stock Position (kalau file-nya diupload).
+            op_data_raw = parse_op_file(op_content)
+            st.session_state['shared_op_data_raw'] = op_data_raw
+
+            if file_pos is not None:
+                stock_position = load_participant_stock_position(file_pos)
+                st.session_state['shared_stock_position'] = stock_position
+                st.session_state['shared_op_data'] = apply_position_adjustment_to_op(op_data_raw, stock_position)
+            else:
+                st.session_state['shared_stock_position'] = {}
+                st.session_state['shared_op_data'] = op_data_raw
+            # [SELESAI DIUBAH]
+
+            netting, cid_to_sid, sid_to_name = parse_netting_invoice(file_netinv)
             net_buy, net_sell   = split_netting(netting)
             st.session_state['shared_netting']    = netting
             st.session_state['shared_net_buy']    = net_buy
@@ -360,6 +456,11 @@ if shared_ready:
                    f"{len(st.session_state['shared_closing_prices'])} harga saham, "
                    f"{len(st.session_state['shared_netting'])} SID di Netting Invoice, "
                    f"{len(st.session_state['shared_cl_data'])} SID di Credit Limit.")
+        # [BARU] Info jumlah SID yang kena koreksi Participant Stock Position
+        n_adj_sid = len(st.session_state.get('shared_stock_position') or {})
+        if file_pos is not None:
+            st.info(f"🔄 Posisi OP disesuaikan dengan Participant Stock Position — "
+                    f"**{n_adj_sid}** SID mengalami koreksi qty saham (commitment belum settle T+2).")
     cl_vdate = st.session_state.get('shared_cl_value_date')
     if cl_vdate:
         today_check = datetime.today().strftime("%Y/%m/%d")
