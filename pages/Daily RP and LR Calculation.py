@@ -25,6 +25,7 @@ for key in [
 
 if 'clamped_warnings' not in st.session_state:
     st.session_state['clamped_warnings'] = []
+    
 if 'sid_results_original' not in st.session_state:
     st.session_state['sid_results_original'] = {}
 
