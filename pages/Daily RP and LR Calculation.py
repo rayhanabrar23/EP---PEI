@@ -325,7 +325,7 @@ with col2:
 with col3:
     file_op     = st.file_uploader("3. Outstanding Position (.txt)", type=['txt'], key='shared_op')
 with col4:
-    file_netinv = st.file_uploader("4. Netting Invoice / List of Invoice (.csv/.xls/.xlsx)",
+    file_netinv = st.file_uploader("4. List of Invoice (.csv/.xls/.xlsx)",
                                     type=['csv', 'xls', 'xlsx'], key='shared_netinv')
 with col5:
     file_cl     = st.file_uploader("5. Credit Limit (.txt)", type=['txt'], key='shared_cl')
